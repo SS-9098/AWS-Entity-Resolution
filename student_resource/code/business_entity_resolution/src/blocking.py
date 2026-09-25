@@ -540,6 +540,7 @@ def _apply_country_filter(
             # Unknown country — keep all candidates.
             filtered[s1_id] = cand_ids
             continue
+        # Use set comprehension for efficient filtering.
         kept = {
             cid for cid in cand_ids
             if ref_countries.get(cid, "") == s1_country
@@ -553,6 +554,61 @@ def _apply_country_filter(
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+def _build_ref_entity_map_for_ids(
+    ref_df: pd.DataFrame,
+    needed_ids: set[str],
+    *,
+    name_col: str = "norm_name",
+    id_col: str = "entity_id",
+) -> tuple[dict[str, str], dict[str, str], dict[str, dict]]:
+    """Build lookups only for referenced entity IDs (memory-efficient).
+
+    Returns three dicts: names, addresses, and address components,
+    filtered to only the entities in *needed_ids*. This is much smaller
+    than loading all ref_df entities when candidates are pruned.
+
+    Parameters
+    ----------
+    ref_df : DataFrame
+        Reference dataframe (S2 + S3 combined).
+    needed_ids : set[str]
+        Only build lookups for these entity IDs.
+    name_col : str
+        Column name for normalized names.
+    id_col : str
+        Column name for entity IDs.
+
+    Returns
+    -------
+    tuple[dict, dict, dict]
+        (names_dict, addresses_dict, components_dict) for needed_ids only.
+    """
+    ref_ids_str = ref_df[id_col].astype(str)
+    mask = ref_ids_str.isin(needed_ids)
+    filtered_df = ref_df[mask]
+
+    names = dict(
+        zip(
+            filtered_df[id_col].astype(str),
+            filtered_df[name_col].fillna("").astype(str),
+        )
+    )
+    addr = dict(
+        zip(
+            filtered_df[id_col].astype(str),
+            filtered_df.get("norm_address", pd.Series([""] * len(filtered_df))).fillna("").astype(str),
+        )
+    )
+    comp = dict(
+        zip(
+            filtered_df[id_col].astype(str),
+            filtered_df.get("addr_components", pd.Series([{}] * len(filtered_df))),
+        )
+    )
+
+    return names, addr, comp
+
 
 def prune_candidates_by_name(
     candidates: dict[str, set[str]],
@@ -570,15 +626,37 @@ def prune_candidates_by_name(
     name similarity is at least *min_score*. This is the set fed to the
     full feature / ML stage (and therefore what belongs in
     ``candidate_pairs.tsv``).
+
+    Memory optimization: builds S1 lookups once, but reference entity lookups
+    are built only for candidates that appear (much smaller subset).
     """
     from rapidfuzz import fuzz as rfuzz
+    import gc
 
-    s1_names = dict(zip(s1_df[id_col].astype(str), s1_df[name_col].fillna("").astype(str)))
-    ref_names = dict(zip(ref_df[id_col].astype(str), ref_df[name_col].fillna("").astype(str)))
-    s1_addr = dict(zip(s1_df[id_col].astype(str), s1_df.get("norm_address", pd.Series([""] * len(s1_df))).fillna("").astype(str)))
-    ref_addr = dict(zip(ref_df[id_col].astype(str), ref_df.get("norm_address", pd.Series([""] * len(ref_df))).fillna("").astype(str)))
-    s1_comp = dict(zip(s1_df[id_col].astype(str), s1_df.get("addr_components", pd.Series([{}] * len(s1_df)))))
-    ref_comp = dict(zip(ref_df[id_col].astype(str), ref_df.get("addr_components", pd.Series([{}] * len(ref_df)))))
+    s1_ids_str = s1_df[id_col].astype(str)
+    s1_names = dict(zip(s1_ids_str, s1_df[name_col].fillna("").astype(str)))
+    s1_addr = dict(
+        zip(
+            s1_ids_str,
+            s1_df.get("norm_address", pd.Series([""] * len(s1_df))).fillna("").astype(str),
+        )
+    )
+    s1_comp = dict(
+        zip(
+            s1_ids_str,
+            s1_df.get("addr_components", pd.Series([{}] * len(s1_df))),
+        )
+    )
+
+    # Collect all unique reference entity IDs that appear in candidates.
+    needed_ref_ids: set[str] = set()
+    for cands in candidates.values():
+        needed_ref_ids.update(cands)
+
+    # Build reference lookups only for needed entities.
+    ref_names, ref_addr, ref_comp = _build_ref_entity_map_for_ids(
+        ref_df, needed_ref_ids, name_col=name_col, id_col=id_col
+    )
 
     pruned: dict[str, set[str]] = {}
     for s1_id, cands in tqdm(candidates.items(), desc="Pruning candidates", leave=False):
@@ -601,9 +679,32 @@ def prune_candidates_by_name(
 
             s1_c = s1_comp.get(s1_id, {}) or {}
             ref_c = ref_comp.get(cid, {}) or {}
-            city_score = 1.0 if str(s1_c.get("city", "")).strip().lower() and str(s1_c.get("city", "")).strip().lower() == str(ref_c.get("city", "")).strip().lower() else 0.0
-            state_score = 1.0 if str(s1_c.get("state", "")).strip().lower() and str(s1_c.get("state", "")).strip().lower() == str(ref_c.get("state", "")).strip().lower() else 0.0
-            pin_score = 1.0 if str(s1_c.get("pin_code", "")).strip() and str(s1_c.get("pin_code", "")).strip() == str(ref_c.get("pin_code", "")).strip() else 0.0
+            city_score = (
+                1.0
+                if (
+                    str(s1_c.get("city", "")).strip().lower()
+                    and str(s1_c.get("city", "")).strip().lower()
+                    == str(ref_c.get("city", "")).strip().lower()
+                )
+                else 0.0
+            )
+            state_score = (
+                1.0
+                if (
+                    str(s1_c.get("state", "")).strip().lower()
+                    and str(s1_c.get("state", "")).strip().lower()
+                    == str(ref_c.get("state", "")).strip().lower()
+                )
+                else 0.0
+            )
+            pin_score = (
+                1.0
+                if (
+                    str(s1_c.get("pin_code", "")).strip()
+                    and str(s1_c.get("pin_code", "")).strip() == str(ref_c.get("pin_code", "")).strip()
+                )
+                else 0.0
+            )
 
             structural = 0.20 * city_score + 0.30 * state_score + 0.50 * pin_score
             score = 0.62 * name_score + 0.24 * addr_score + 0.14 * structural
@@ -632,6 +733,10 @@ def prune_candidates_by_name(
         scored.sort(reverse=True)
         pruned[s1_id] = {cid for _, cid in scored[:max_per_s1]}
 
+    # Clean up large intermediate structures.
+    del ref_names, ref_addr, ref_comp, s1_names, s1_addr, s1_comp
+    gc.collect()
+
     return pruned
 
 
@@ -658,7 +763,12 @@ def generate_candidates(
     builds blocking indices once, and then queries them with Source 1.
     An optional name-similarity prune produces the final candidate set
     that is scored by the matcher (and written to ``candidate_pairs.tsv``).
+
+    Memory optimization: country dict is built only from entities that
+    appear in candidates (not all ref entities).
     """
+    import gc
+
     logger.info(
         "generate_candidates: S1=%d, S2=%d, S3=%d rows",
         len(s1_df), len(s2_df), len(s3_df),
@@ -717,19 +827,31 @@ def generate_candidates(
             all_candidates.update(batch_candidates)
 
     if country_filter:
+        # Build S1 countries dict once (it's smaller).
         s1_countries = dict(
             zip(
                 s1_df[id_col].astype(str),
                 s1_df[country_col].fillna("").astype(str),
             )
         )
+
+        # Build ref_countries dict only for entities appearing in candidates.
+        needed_ref_ids: set[str] = set()
+        for cands in all_candidates.values():
+            needed_ref_ids.update(cands)
+
+        ref_ids_str = ref_df[id_col].astype(str)
+        mask = ref_ids_str.isin(needed_ref_ids)
         ref_countries = dict(
             zip(
-                ref_df[id_col].astype(str),
-                ref_df[country_col].fillna("").astype(str),
+                ref_df.loc[mask, id_col].astype(str),
+                ref_df.loc[mask, country_col].fillna("").astype(str),
             )
         )
+
         all_candidates = _apply_country_filter(all_candidates, s1_countries, ref_countries)
+        del s1_countries, ref_countries, needed_ref_ids
+        gc.collect()
 
     raw_total = sum(len(v) for v in all_candidates.values())
     print(f"  Raw blocked pairs (pre-prune): {raw_total:,}")

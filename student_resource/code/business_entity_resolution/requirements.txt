@@ -7,3 +7,4 @@ jellyfish>=1.0
 unidecode>=1.3
 indic-transliteration>=2.3
 tqdm>=4.65
+duckdb>=1.0
