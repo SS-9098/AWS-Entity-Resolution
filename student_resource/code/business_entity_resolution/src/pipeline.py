@@ -36,6 +36,25 @@ from matching import (
 from preprocessing import preprocess_dataframe
 
 
+_MATCHING_COLUMNS = [
+    "entity_id",
+    "country",
+    "norm_name",
+    "norm_address",
+    "name_tokens",
+    "addr_components",
+]
+
+
+def _trim_matching_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop raw source columns after preprocessing to reduce resident memory."""
+    keep = [c for c in _MATCHING_COLUMNS if c in df.columns]
+    drop = [c for c in df.columns if c not in keep]
+    if drop:
+        df.drop(columns=drop, inplace=True)
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Data I/O
 # ---------------------------------------------------------------------------
@@ -310,6 +329,9 @@ def run_train_pipeline(
     s1 = preprocess_dataframe(s1)
     s2 = preprocess_dataframe(s2)
     s3 = preprocess_dataframe(s3)
+    s1 = _trim_matching_frame(s1)
+    s2 = _trim_matching_frame(s2)
+    s3 = _trim_matching_frame(s3)
     print(f"Preprocessing done in {time.time() - t0:.1f}s")
 
     print("\nComputing IDF weights...")
@@ -378,15 +400,9 @@ def run_train_pipeline(
     print("Evaluating on training candidates...")
     print("=" * 60)
 
-    # Score every blocked candidate (not just the subsampled train pairs).
-    eval_cands = {
-        sid: sorted(cands)
-        for sid, cands in candidate_pairs.items()
-        if cands
-    }
     t0 = time.time()
     eval_features = compute_features_batch(
-        s1, s2s3, eval_cands, idf_weights=idf_weights, n_workers=1
+        s1, s2s3, candidate_pairs, idf_weights=idf_weights, n_workers=1
     )
     print(f"Eval feature computation done in {time.time() - t0:.1f}s")
 
@@ -437,6 +453,9 @@ def run_test_pipeline(
     s1 = preprocess_dataframe(s1)
     s2 = preprocess_dataframe(s2)
     s3 = preprocess_dataframe(s3)
+    s1 = _trim_matching_frame(s1)
+    s2 = _trim_matching_frame(s2)
+    s3 = _trim_matching_frame(s3)
     print(f"Preprocessing done in {time.time() - t0:.1f}s")
 
     if idf_weights is None:
@@ -465,17 +484,15 @@ def run_test_pipeline(
     print("=" * 60)
 
     s2s3 = pd.concat([s2, s3], ignore_index=True)
-    eval_cands = {sid: sorted(cands) for sid, cands in candidate_pairs.items() if cands}
-    print(f"  S1 entities with candidates: {len(eval_cands):,}")
-    print(
-        f"  Total pairs to score: "
-        f"{sum(len(v) for v in eval_cands.values()):,}"
-    )
+    n_s1_with_cands = sum(1 for cands in candidate_pairs.values() if cands)
+    total_pairs = sum(len(v) for v in candidate_pairs.values())
+    print(f"  S1 entities with candidates: {n_s1_with_cands:,}")
+    print(f"  Total pairs to score: {total_pairs:,}")
 
-    if eval_cands:
+    if total_pairs:
         t0 = time.time()
         eval_features = compute_features_batch(
-            s1, s2s3, eval_cands, idf_weights=idf_weights, n_workers=1
+            s1, s2s3, candidate_pairs, idf_weights=idf_weights, n_workers=1
         )
         print(f"Feature computation done in {time.time() - t0:.1f}s")
 

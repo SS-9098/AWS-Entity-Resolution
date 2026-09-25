@@ -468,7 +468,7 @@ def generate_candidates(
     max_token_freq: int = 5000,
     country_filter: bool = True,
     predicate_predicates: list[Callable[..., str | None]] | None = None,
-    batch_size: int = 500_000,
+    batch_size: int = 100_000,
     prune: bool = True,
     prune_min_score: float = 0.55,
     prune_max_per_s1: int = 100,

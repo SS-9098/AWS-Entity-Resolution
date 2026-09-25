@@ -15,7 +15,7 @@ from __future__ import annotations
 import math
 import multiprocessing as mp
 from functools import partial
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 import jellyfish
 import numpy as np
@@ -595,7 +595,8 @@ def _process_chunk(
 def _df_to_lookup(df: pd.DataFrame) -> Dict[str, dict]:
     """Convert a DataFrame into a ``{entity_id: row_dict}`` lookup.
 
-    Prefer vectorised ``to_dict('index')`` over ``iterrows`` for large frames.
+    Only retain the columns needed for feature computation to keep the
+    in-memory lookup as small as possible.
     """
     if "entity_id" not in df.columns:
         # Already indexed by entity_id
@@ -608,6 +609,19 @@ def _df_to_lookup(df: pd.DataFrame) -> Dict[str, dict]:
     else:
         work = df
 
+    keep_cols = [
+        c
+        for c in (
+            "entity_id",
+            "norm_name",
+            "norm_address",
+            "name_tokens",
+            "addr_components",
+            "country",
+        )
+        if c in work.columns
+    ]
+    work = work[keep_cols]
     records = work.to_dict(orient="records")
     return {str(rec["entity_id"]): rec for rec in records}
 
@@ -615,10 +629,10 @@ def _df_to_lookup(df: pd.DataFrame) -> Dict[str, dict]:
 def compute_features_batch(
     s1_df: pd.DataFrame,
     s2s3_df: pd.DataFrame,
-    candidate_pairs: Dict[str, List[str]],
+    candidate_pairs: Mapping[str, Iterable[str]],
     idf_weights: Optional[Dict[str, float]] = None,
     chunk_size: int = 5_000,
-    n_workers: Optional[int] = None,
+    n_workers: Optional[int] = 1,
 ) -> pd.DataFrame:
     """Compute features for all candidate pairs in batch.
 
@@ -636,36 +650,35 @@ def compute_features_batch(
     chunk_size:
         Number of pairs per processing chunk (controls memory).
     n_workers:
-        Number of worker processes.  Defaults to ``min(cpu_count, 8)``.
+        Number of worker processes.  Defaults to ``1`` to minimise memory use.
 
     Returns
     -------
     pd.DataFrame
         Columns: ``s1_id``, ``s2s3_id``, and all feature columns.
     """
-    # -- flatten candidate_pairs into a list of (s1_id, s2s3_id) tuples --
-    all_pairs: List[tuple] = []
-    for s1_id, s2s3_ids in candidate_pairs.items():
-        for s2s3_id in s2s3_ids:
-            all_pairs.append((str(s1_id), str(s2s3_id)))
-
-    if not all_pairs:
-        return pd.DataFrame(columns=["s1_id", "s2s3_id"] + _FEATURE_COLUMNS)
+    def _pair_chunks() -> Iterable[List[tuple[str, str]]]:
+        chunk: List[tuple[str, str]] = []
+        for s1_id, s2s3_ids in candidate_pairs.items():
+            for s2s3_id in s2s3_ids:
+                chunk.append((str(s1_id), str(s2s3_id)))
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
+        if chunk:
+            yield chunk
 
     # -- build lookups --
     s1_lookup = _df_to_lookup(s1_df)
     s2s3_lookup = _df_to_lookup(s2s3_df)
 
-    # -- split into chunks --
-    chunks = [all_pairs[i : i + chunk_size] for i in range(0, len(all_pairs), chunk_size)]
-
     if n_workers is None:
-        n_workers = min(mp.cpu_count(), 8)
+        n_workers = 1
 
-    all_rows: List[Dict[str, Any]] = []
+    result_frames: List[pd.DataFrame] = []
 
     # Use multiprocessing for large workloads, single-process for small ones.
-    if n_workers > 1 and len(all_pairs) > chunk_size:
+    if n_workers > 1:
         worker_fn = partial(
             _process_chunk,
             s1_lookup=s1_lookup,
@@ -674,22 +687,32 @@ def compute_features_batch(
         )
         with mp.Pool(processes=n_workers) as pool:
             for chunk_result in tqdm(
-                pool.imap_unordered(worker_fn, chunks),
-                total=len(chunks),
+                pool.imap_unordered(worker_fn, _pair_chunks()),
                 desc="Computing features",
                 unit="chunk",
             ):
-                all_rows.extend(chunk_result)
+                if chunk_result:
+                    result_frames.append(
+                        pd.DataFrame.from_records(
+                            chunk_result,
+                            columns=["s1_id", "s2s3_id"] + _FEATURE_COLUMNS,
+                        )
+                    )
     else:
-        for chunk in tqdm(chunks, desc="Computing features", unit="chunk"):
-            all_rows.extend(
-                _process_chunk(chunk, s1_lookup, s2s3_lookup, idf_weights)
-            )
+        for chunk in tqdm(_pair_chunks(), desc="Computing features", unit="chunk"):
+            chunk_rows = _process_chunk(chunk, s1_lookup, s2s3_lookup, idf_weights)
+            if chunk_rows:
+                result_frames.append(
+                    pd.DataFrame.from_records(
+                        chunk_rows,
+                        columns=["s1_id", "s2s3_id"] + _FEATURE_COLUMNS,
+                    )
+                )
 
-    if not all_rows:
+    if not result_frames:
         return pd.DataFrame(columns=["s1_id", "s2s3_id"] + _FEATURE_COLUMNS)
 
-    result_df = pd.DataFrame(all_rows)
-    # Ensure consistent column order.
-    result_df = result_df[["s1_id", "s2s3_id"] + _FEATURE_COLUMNS]
-    return result_df
+    if len(result_frames) == 1:
+        return result_frames[0]
+
+    return pd.concat(result_frames, ignore_index=True)
