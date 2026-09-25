@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import jellyfish
 import pandas as pd
@@ -192,24 +192,21 @@ class PredicateBlocker:
 
     # ----- querying ---------------------------------------------------------
 
-    def query(
+    def iter_query(
         self,
         df: pd.DataFrame,
         name_col: str = "norm_name",
         country_col: str = "country",
         id_col: str = "entity_id",
-    ) -> dict[str, set[str]]:
-        """Look up candidates for every entity in *df* (the S1 side).
+    ) -> Iterator[tuple[str, set[str]]]:
+        """Yield candidates for every entity in *df* (the S1 side).
 
-        Returns
-        -------
-        dict[str, set[str]]
-            Mapping ``{s1_entity_id: {candidate_entity_ids}}``.
+        Streaming the results keeps peak memory lower than building a full
+        batch-sized ``dict[str, set[str]]`` before the caller can consume it.
         """
         if not self._indices:
             raise RuntimeError("Call build_index() before query().")
 
-        candidates: dict[str, set[str]] = defaultdict(set)
         names = df[name_col].values
         countries = df[country_col].values
         ids = df[id_col].values
@@ -218,12 +215,30 @@ class PredicateBlocker:
             name = str(names[i]) if pd.notna(names[i]) else ""
             country = str(countries[i]) if pd.notna(countries[i]) else ""
             eid = str(ids[i])
+            merged: set[str] | None = None
             for pidx, pred in enumerate(self.predicates):
                 key = pred(name, country)
-                if key is not None and key in self._indices[pidx]:
-                    candidates[eid].update(self._indices[pidx][key])
+                if key is None:
+                    continue
+                index = self._indices[pidx].get(key)
+                if not index:
+                    continue
+                if merged is None:
+                    merged = set()
+                merged.update(index)
 
-        return dict(candidates)
+            if merged:
+                yield eid, merged
+
+    def query(
+        self,
+        df: pd.DataFrame,
+        name_col: str = "norm_name",
+        country_col: str = "country",
+        id_col: str = "entity_id",
+    ) -> dict[str, set[str]]:
+        """Look up candidates for every entity in *df* (the S1 side)."""
+        return dict(self.iter_query(df, name_col=name_col, country_col=country_col, id_col=id_col))
 
 
 # ---------------------------------------------------------------------------
@@ -311,23 +326,16 @@ class TokenBlocker:
 
     # ----- querying ---------------------------------------------------------
 
-    def query(
+    def iter_query(
         self,
         df: pd.DataFrame,
         name_col: str = "norm_name",
         id_col: str = "entity_id",
-    ) -> dict[str, set[str]]:
-        """Find candidates for every S1 entity via token overlap.
-
-        Returns
-        -------
-        dict[str, set[str]]
-            ``{s1_entity_id: {candidate_entity_ids}}``.
-        """
+    ) -> Iterator[tuple[str, set[str]]]:
+        """Yield candidates for every S1 entity via token overlap."""
         if not self._index:
             raise RuntimeError("Call build_index() before query().")
 
-        candidates: dict[str, set[str]] = defaultdict(set)
         names = df[name_col].values
         ids = df[id_col].values
 
@@ -335,24 +343,43 @@ class TokenBlocker:
             name = str(names[i]) if pd.notna(names[i]) else ""
             eid = str(ids[i])
             tokens = set(name.split())
+            merged: set[str] | None = None
 
             if self.min_shared_tokens <= 1:
                 # Fast path: any shared token is enough.
                 for tok in tokens:
-                    if tok in self._index:
-                        candidates[eid].update(self._index[tok])
+                    index = self._index.get(tok)
+                    if not index:
+                        continue
+                    if merged is None:
+                        merged = set()
+                    merged.update(index)
             else:
                 # Count shared tokens per candidate and threshold.
                 overlap_count: dict[str, int] = defaultdict(int)
                 for tok in tokens:
-                    if tok in self._index:
-                        for cid in self._index[tok]:
-                            overlap_count[cid] += 1
+                    index = self._index.get(tok)
+                    if not index:
+                        continue
+                    for cid in index:
+                        overlap_count[cid] += 1
+                if overlap_count:
+                    merged = set()
                 for cid, cnt in overlap_count.items():
                     if cnt >= self.min_shared_tokens:
-                        candidates[eid].add(cid)
+                        merged.add(cid)
 
-        return dict(candidates)
+            if merged:
+                yield eid, merged
+
+    def query(
+        self,
+        df: pd.DataFrame,
+        name_col: str = "norm_name",
+        id_col: str = "entity_id",
+    ) -> dict[str, set[str]]:
+        """Find candidates for every S1 entity via token overlap."""
+        return dict(self.iter_query(df, name_col=name_col, id_col=id_col))
 
 
 # ---------------------------------------------------------------------------
@@ -468,7 +495,7 @@ def generate_candidates(
     max_token_freq: int = 5000,
     country_filter: bool = True,
     predicate_predicates: list[Callable[..., str | None]] | None = None,
-    batch_size: int = 100_000,
+    batch_size: int = 25_000,
     prune: bool = True,
     prune_min_score: float = 0.55,
     prune_max_per_s1: int = 100,
@@ -508,18 +535,22 @@ def generate_candidates(
         s1_batch = s1_df.iloc[start:end]
         logger.info("Processing S1 batch %d/%d (%d–%d)", batch_idx + 1, n_batches, start, end)
 
-        pred_cands = pred_blocker.query(s1_batch, name_col=name_col, country_col=country_col, id_col=id_col)
-        tok_cands = tok_blocker.query(s1_batch, name_col=name_col, id_col=id_col)
+        batch_candidates: dict[str, set[str]] = {}
 
-        batch_ids = s1_batch[id_col].astype(str).values
-        for eid in batch_ids:
-            merged = set()
-            if eid in pred_cands:
-                merged.update(pred_cands[eid])
-            if eid in tok_cands:
-                merged.update(tok_cands[eid])
-            if merged:
-                all_candidates[eid] = merged
+        for eid, cands in pred_blocker.iter_query(
+            s1_batch, name_col=name_col, country_col=country_col, id_col=id_col
+        ):
+            batch_candidates[eid] = cands
+
+        for eid, cands in tok_blocker.iter_query(s1_batch, name_col=name_col, id_col=id_col):
+            existing = batch_candidates.get(eid)
+            if existing is None:
+                batch_candidates[eid] = cands
+            else:
+                existing.update(cands)
+
+        if batch_candidates:
+            all_candidates.update(batch_candidates)
 
     if country_filter:
         s1_countries = dict(
